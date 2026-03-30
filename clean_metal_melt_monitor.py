@@ -1,44 +1,13 @@
-"""
-metal_melt_pipeline.py  [combined v1]
-──────────────────────────────────────────────────────────────────────────────
-Merges:
-  • clean_metal_melt_monitor.py  (v3)  — UK ECUK Table I4 + Eurostat parser
-                                          → uk_metals_intensity_clean.csv
-                                          → metal_melt_dashboard_master.csv
-  • build_eedi05_with_uk.py      (v4)  — adds UK EEDI05 derived from ECUK
-                                          (rebased 2005=100) into the benchmark
-                                          → eu_eedi05_benchmark_clean.csv
-                                          → data_quality_log.csv  (enhanced)
-
-INPUT FILES (place in same folder as this script):
-  • ECUK_2025_Intensity_tables.xlsx
-  • estat_nrg_ind_eff_en.csv
-
-OUTPUT FILES  →  <script_dir>/cleaned_data/
-  • uk_metals_intensity_clean.csv
-  • eu_eedi05_benchmark_clean.csv        ← UK rows now come from ECUK, not
-                                            Eurostat (UK left Eurostat post-Brexit)
-  • metal_melt_dashboard_master.csv
-  • data_quality_log.csv
-
-Requirements:
-    pip install pandas openpyxl
-"""
-
 import sys
 import pandas as pd
 import numpy as np
 from pathlib import Path
 
-# ── dependency check ─────────────────────────────────────────────────────────
+# dependency check 
 try:
-    import openpyxl  # noqa: F401
+    import openpyxl  
 except ImportError:
     sys.exit("\n[ERROR] openpyxl not installed.  Fix: pip install openpyxl\n")
-
-# =============================================================================
-# CONFIG
-# =============================================================================
 BASE_DIR        = Path(__file__).parent.resolve()
 INTENSITY_FILE  = BASE_DIR / "ECUK_2025_Intensity_tables.xlsx"
 EUROSTAT_FILE   = BASE_DIR / "estat_nrg_ind_eff_en.csv"
@@ -48,8 +17,6 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 YEAR_MIN = 2005
 YEAR_MAX = 2024
 
-# EU geo codes for Eurostat — UK is intentionally excluded here because the
-# UK is no longer in Eurostat data post-Brexit; we derive it from ECUK instead.
 EU_GEOS = ["EU27_2020", "DE", "FR", "IT", "ES", "PL", "NL"]
 
 GEO_NAME_MAP = {
@@ -62,10 +29,6 @@ GEO_NAME_MAP = {
     "PL":        "Poland",
     "NL":        "Netherlands",
 }
-
-# =============================================================================
-# SHARED HELPERS
-# =============================================================================
 
 def to_numeric_safe(series: pd.Series) -> pd.Series:
     """Coerce a mixed-type column to float, turning sentinel strings into NaN."""
@@ -97,31 +60,11 @@ def _find_sector_col(df: pd.DataFrame, row: int, sector: str) -> int | None:
             return j
     return None
 
-# =============================================================================
-# PART 1 — ECUK TABLE I4 PARSER
-#   Shared by both original scripts; produces the full metals sector block
-#   used for uk_metals_intensity_clean.csv AND the UK EEDI05 derivation.
-# =============================================================================
-
 def parse_ecuk_table_i4(
     df_raw: pd.DataFrame,
     sector_name: str = "Iron steel, non-ferrous metals",
 ) -> pd.DataFrame:
-    """
-    Parse a horizontal multi-sector Table I4 sheet and return the named sector.
-
-    Expected column layout per sector block (7 columns):
-        Year | Consumption ktoe | Output | Consumption per unit of output |
-        Consumption index 2000=100 | Output index 2000=100 | CPUO index 2000=100
-
-    The 'Year' column is shared on the left; sector blocks follow to the right.
-    Returns a DataFrame with columns:
-        year, sector, consumption_ktoe, output, consumption_per_unit_output,
-        consumption_index_2000_100, output_index_2000_100, intensity_index_2000_100
-    """
     df_str = df_raw.astype(str)
-
-    # 1. locate sector-header row
     hdr_row = _find_header_row(df_str, sector_name.split(",")[0])   # "Iron steel"
     if hdr_row is None:
         hdr_row = _find_header_row(df_str, "iron")
@@ -130,8 +73,6 @@ def parse_ecuk_table_i4(
             f"Could not find sector header row for '{sector_name}' in Table I4.\n"
             "Check that the sheet name and sector label match the workbook exactly."
         )
-
-    # 2. locate sector start column
     start_col = _find_sector_col(df_str, hdr_row, sector_name)
     if start_col is None:
         for j, val in enumerate(df_str.iloc[hdr_row]):
@@ -144,8 +85,6 @@ def parse_ecuk_table_i4(
             f"in header row {hdr_row}.\n"
             f"Row contents: {df_str.iloc[hdr_row].tolist()}"
         )
-
-    # 3. extract 7-column block
     end_col = min(start_col + 7, df_raw.shape[1])
     block   = df_raw.iloc[:, start_col:end_col].copy()
     n_cols  = block.shape[1]
@@ -159,23 +98,15 @@ def parse_ecuk_table_i4(
         "intensity_index_2000_100",
     ]
     block.columns = base_col_names[:n_cols] if n_cols <= 6 else base_col_names + ["extra"]
-
-    # 4. attach Year column
     block.insert(0, "year", df_raw.iloc[:, 0])
-
-    # 5. numeric coercion
     block["year"] = to_numeric_safe(block["year"]).astype("Int64")
     for col in block.columns[1:]:
         if col != "extra":
             block[col] = to_numeric_safe(block[col])
-
-    # 6. keep only data rows with a valid year (≥ 1990)
     block = block[block["year"].notna()].copy()
     block["year"] = block["year"].astype(int)
     block = block[block["year"] >= 1990].copy()
     block = block[[c for c in block.columns if c != "extra"]]
-
-    # 7. add sector label and tidy column order
     block["sector"] = "Iron, steel, non-ferrous metals"
     desired_order = [
         "year", "sector",
@@ -185,12 +116,6 @@ def parse_ecuk_table_i4(
     ]
     final_cols = [c for c in desired_order if c in block.columns]
     return block[final_cols].reset_index(drop=True)
-
-# =============================================================================
-# PART 2 — DERIVE UK EEDI05 FROM ECUK  (v4 contribution)
-#   Converts the ECUK intensity index (base 2000=100) to a 2005=100 index
-#   compatible with the Eurostat EEDI05 benchmark series.
-# =============================================================================
 
 def derive_uk_eedi05(ecuk_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -225,12 +150,6 @@ def derive_uk_eedi05(ecuk_df: pd.DataFrame) -> pd.DataFrame:
     uk["source"]  = "ECUK (rebased 2005=100)"
 
     return uk[["geo", "country", "year", "eedi05_index", "source"]].reset_index(drop=True)
-
-# =============================================================================
-# PART 3 — EUROSTAT CSV PARSER  (EU comparators only)
-#   Filters on nrg_bal == "FEC_EED" AND unit == "I05" for EU_GEOS.
-#   UK is no longer requested from Eurostat — it's supplied by derive_uk_eedi05.
-# =============================================================================
 
 def parse_eurostat_eedi05(file_path: Path, geos: list[str]) -> pd.DataFrame:
     """
@@ -292,13 +211,8 @@ def parse_eurostat_eedi05(file_path: Path, geos: list[str]) -> pd.DataFrame:
 
     return df[["geo", "country", "year", "eedi05_index", "source"]] if not df.empty else df
 
-# =============================================================================
-# MAIN
-# =============================================================================
-
 def main() -> None:
 
-    # ── validate inputs ───────────────────────────────────────────────────────
     missing = [f for f in [INTENSITY_FILE, EUROSTAT_FILE] if not f.exists()]
     if missing:
         sys.exit(
@@ -306,10 +220,6 @@ def main() -> None:
             + "\n".join(f"  {p}" for p in missing)
             + f"\n\nExpected directory: {BASE_DIR}\n"
         )
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # STEP 1 — ECUK workbook  →  full metals block + UK EEDI05 rows
-    # ═════════════════════════════════════════════════════════════════════════
     print("=" * 60)
     print("STEP 1: Reading ECUK intensity workbook...")
     xls = pd.ExcelFile(INTENSITY_FILE, engine="openpyxl")
@@ -327,10 +237,7 @@ def main() -> None:
         INTENSITY_FILE, sheet_name=i4_sheet, header=None, engine="openpyxl"
     )
 
-    # Full sector block (for uk_metals_intensity_clean.csv)
     metals_df = parse_ecuk_table_i4(df_i4_raw)
-
-    # Add quality flags
     for col_short, col_full in [
         ("consumption", "consumption_ktoe"),
         ("output",      "output"),
@@ -350,10 +257,6 @@ def main() -> None:
         f"({uk_eedi05_df['year'].min()}–{uk_eedi05_df['year'].max()})"
     )
     print(uk_eedi05_df.head(3).to_string(index=False))
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # STEP 2 — Eurostat CSV  →  EU comparator rows (no UK requested)
-    # ═════════════════════════════════════════════════════════════════════════
     print("\n" + "=" * 60)
     print("STEP 2: Reading Eurostat EEDI05 CSV...")
     eu_df = parse_eurostat_eedi05(EUROSTAT_FILE, EU_GEOS)
@@ -364,11 +267,6 @@ def main() -> None:
         print(eu_df.head(6).to_string(index=False))
     else:
         print("  [WARNING] Eurostat DataFrame is empty.")
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # STEP 3 — Combined benchmark  =  EU (Eurostat) + UK (ECUK derived)
-    #   Order: EU countries alphabetically first, then United Kingdom
-    # ═════════════════════════════════════════════════════════════════════════
     print("\n" + "=" * 60)
     print("STEP 3: Building combined EEDI05 benchmark...")
 
@@ -380,12 +278,6 @@ def main() -> None:
         f"  Combined benchmark: {len(combined_eedi05)} rows  |  "
         f"Countries: {sorted(combined_eedi05['country'].unique())}"
     )
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # STEP 4 — Dashboard master
-    #   Join ECUK metals block with the UK EEDI05 series on year,
-    #   plus compute efficiency proxy (1 / consumption_per_unit_output).
-    # ═════════════════════════════════════════════════════════════════════════
     print("\n" + "=" * 60)
     print("STEP 4: Building dashboard master table...")
 
@@ -408,10 +300,6 @@ def main() -> None:
         f"  Dashboard master: {len(metals_dashboard)} rows, "
         f"{metals_dashboard.shape[1]} columns"
     )
-
-    # ═════════════════════════════════════════════════════════════════════════
-    # STEP 5 — Write outputs
-    # ═════════════════════════════════════════════════════════════════════════
     print("\n" + "=" * 60)
     print("STEP 5: Writing output files...")
 
@@ -419,7 +307,6 @@ def main() -> None:
     combined_eedi05.to_csv(  OUTPUT_DIR / "eu_eedi05_benchmark_clean.csv",   index=False)
     metals_dashboard.to_csv( OUTPUT_DIR / "metal_melt_dashboard_master.csv", index=False)
 
-    # ── enhanced quality log (v4 style: file summary + per-country detail) ──
     country_stats = (
         combined_eedi05.groupby("country")
         .agg(
@@ -468,7 +355,6 @@ def main() -> None:
         f.write("\n=== PER-COUNTRY EEDI05 DETAIL ===\n")
         country_stats.to_csv(f, index=False)
 
-    # ── print summary ──────────────────────────────────────────────────────
     print("\n" + "─" * 60)
     print("Done.  Output directory:", OUTPUT_DIR)
     print("\nFile summary:")
